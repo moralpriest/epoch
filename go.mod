@@ -5,7 +5,7 @@ go 1.26
 toolchain go1.26.4
 
 require (
-	github.com/civilware/tela v0.0.0-20240912213039-e4e13230c390
+	github.com/civilware/tela v0.0.0-20260530200926-176ee608babd
 	github.com/creachadair/jrpc2 v0.35.4
 	github.com/deroproject/derohe v0.0.0-20240405032004-bd300c0e086e
 	github.com/gorilla/websocket v1.5.0
