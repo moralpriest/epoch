@@ -1,8 +1,8 @@
 module github.com/civilware/epoch
 
-go 1.21
+go 1.26
 
-toolchain go1.21.5
+toolchain go1.26.4
 
 require (
 	github.com/civilware/tela v0.0.0-20240912213039-e4e13230c390
