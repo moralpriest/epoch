@@ -334,15 +334,16 @@ func GetSession(timeout time.Duration) (session GetSessionEPOCH_Result, err erro
 // Compute POW hash from a job template and return variables for block submission
 func powHash() (job rpc.GetBlockTemplate_Result, powhash [32]byte, work [block.MINIBLOCK_SIZE]byte, diff big.Int, err error) {
 	var random_buf [12]byte
-	rand.Read(random_buf[:])
-
-	// nonce_buf := work[block.MINIBLOCK_SIZE-5:] // since slices are linked, it modifies parent
+	if _, err = rand.Read(random_buf[:]); err != nil {
+		err = fmt.Errorf("could not generate random bytes: %w", err)
+		return
+	}
 
 	job = epoch.getJob()
 
 	n, err := hex.Decode(work[:], []byte(job.Blockhashing_blob))
 	if err != nil || n != block.MINIBLOCK_SIZE {
-		err = fmt.Errorf("block hashing could not be decoded successfully %+v %d %v", job, n, err)
+		err = fmt.Errorf("block hashing could not be decoded successfully %+v %d: %w", job, n, err)
 		return
 	}
 
