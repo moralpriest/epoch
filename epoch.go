@@ -112,7 +112,10 @@ func JobIsReady(timeout time.Duration) (err error) {
 			err = fmt.Errorf("could not get EPOCH job after %s", timeout)
 			return
 		default:
-			if epoch.jobs.job.JobID != "" {
+			epoch.jobs.RLock()
+			ready := epoch.jobs.job.JobID != ""
+			epoch.jobs.RUnlock()
+			if ready {
 				return
 			}
 
@@ -228,10 +231,12 @@ func GetMaxThreads() int {
 
 // Stop listening to GetWork server
 func StopGetWork() {
-	if IsActive() {
+	epoch.conn.Lock()
+	if epoch.conn.ws != nil {
 		epoch.conn.ws.Close()
 		epoch.conn.ws = nil
 	}
+	epoch.conn.Unlock()
 }
 
 // Start listening to GetWork server, if address is empty string epoch.address will be used,
@@ -275,18 +280,23 @@ func StartGetWork(address, endpoint string) (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	epoch.conn.ws, _, err = websocket.DefaultDialer.DialContext(ctx, u.String(), nil)
+	ws, _, err := websocket.DefaultDialer.DialContext(ctx, u.String(), nil)
 	if err != nil {
-		epoch.conn.ws = nil
 		return
 	}
+
+	epoch.conn.Lock()
+	epoch.conn.ws = ws
+	epoch.conn.Unlock()
 
 	logger.Printf("[EPOCH] Connected to %s\n", u.String())
 	logger.Printf("[EPOCH] Will use %d threads\n", epoch.maxThreads)
 
+	epoch.Lock()
 	epoch.session.Hashes = 0
 	epoch.session.MiniBlocks = 0
 	epoch.semaphore = make(chan struct{}, epoch.maxThreads)
+	epoch.Unlock()
 
 	go func() {
 		defer StopGetWork()
@@ -322,7 +332,9 @@ func GetSession(timeout time.Duration) (session GetSessionEPOCH_Result, err erro
 			return
 		default:
 			if !IsProcessing() {
+				epoch.RLock()
 				session = epoch.session
+				epoch.RUnlock()
 				return
 			}
 
@@ -400,6 +412,8 @@ func AttemptHashes(hashes int) (result EPOCH_Result, err error) {
 	defer setProcessing(false)
 
 	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var submitted int
 
 	i := 0
 	now := time.Now()
@@ -420,18 +434,26 @@ func AttemptHashes(hashes int) (result EPOCH_Result, err error) {
 
 			job, powhash, work, diff, err := powHash()
 			if err != nil {
-				result.Error = err
+				errMu.Lock()
+				if result.Error == nil {
+					result.Error = err
+				}
+				errMu.Unlock()
 				return
 			}
 
 			valid, err := submitBlock(job, powhash, work, diff)
 			if err != nil {
-				result.Error = err
+				errMu.Lock()
+				if result.Error == nil {
+					result.Error = err
+				}
+				errMu.Unlock()
 				return
 			}
 
 			if valid {
-				result.Submitted++
+				submitted++
 			}
 		}()
 	}
@@ -443,8 +465,13 @@ func AttemptHashes(hashes int) (result EPOCH_Result, err error) {
 
 	h := uint64(i)
 	result.Hashes = h
+	result.Submitted = submitted
+
+	epoch.Lock()
 	epoch.session.Hashes += h
 	epoch.session.MiniBlocks += result.Submitted
+	epoch.Unlock()
+
 	hashPerSecond := float64(h) / duration.Seconds()
 	result.HashPerSec = math.Round(hashPerSecond*100) / 100
 
@@ -469,9 +496,10 @@ func SubmitHashes(params []Submit_Params) (result EPOCH_Result, err error) {
 	defer setProcessing(false)
 
 	var wg sync.WaitGroup
+	var errMu sync.Mutex
 
-	i := 0
 	now := time.Now()
+	submitted := 0
 
 	for _, p := range params {
 		if result.Error != nil {
@@ -489,23 +517,29 @@ func SubmitHashes(params []Submit_Params) (result EPOCH_Result, err error) {
 
 			valid, err := submitBlock(p.Job, p.PowHash, p.EpochWork, p.Difficulty)
 			if err != nil {
-				result.Error = err
+				errMu.Lock()
+				if result.Error == nil {
+					result.Error = err
+				}
+				errMu.Unlock()
 				return
 			}
 
-			i++
 			if valid {
-				result.Submitted++
+				submitted++
 			}
 		}(p)
 	}
 
 	wg.Wait()
 
-	result.Duration = time.Since(now).Milliseconds() // result will likely be in µs so 0
-	result.Hashes = uint64(i)
+	result.Duration = time.Since(now).Milliseconds()
+	result.Hashes = uint64(len(params))
+	result.Submitted = submitted
 
-	epoch.session.MiniBlocks += result.Submitted
+	epoch.Lock()
+	epoch.session.MiniBlocks += submitted
+	epoch.Unlock()
 
 	return
 }
