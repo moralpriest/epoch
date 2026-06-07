@@ -6,10 +6,23 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/civilware/tela/logger"
 	"github.com/creachadair/jrpc2/handler"
 	"github.com/deroproject/derohe/block"
 	"github.com/deroproject/derohe/rpc"
 )
+
+// Address-aware connection reuse for AttemptEPOCHWithAddr:
+// When dApps (e.g. DeroBeats) call AttemptEPOCHWithAddr every ~5s for the
+// same artist, we reuse the existing connection instead of restarting.
+// A 60s keepalive timer shuts down cleanly when the dApp stops calling.
+
+var (
+	lastEpochAddress    string          // last address used by AttemptEPOCHWithAddr
+	epochKeepaliveTimer *time.Timer     // fires 60s after last AttemptEPOCHWithAddr call
+)
+
+const EPOCH_KEEPAWAY_DURATION = 60 * time.Second
 
 var epochHandler = map[string]handler.Func{
 	"AttemptEPOCH":      handler.New(AttemptEPOCH),
@@ -17,6 +30,7 @@ var epochHandler = map[string]handler.Func{
 	"GetMaxHashesEPOCH": handler.New(GetMaxHashesEPOCH),
 	"GetAddressEPOCH":   handler.New(GetAddressEPOCH),
 	"GetSessionEPOCH":   handler.New(GetSessionEPOCH),
+	"StopEPOCH":         handler.New(StopEPOCH),
 }
 
 // Returns methods in epochHandler
@@ -27,6 +41,55 @@ func GetHandler() map[string]handler.Func {
 	}
 
 	return handler
+}
+
+// resetEpochKeepalive resets the 60s silence timer.
+// Called after each AttemptEPOCHWithAddr call to extend the connection.
+func resetEpochKeepalive() {
+	if epochKeepaliveTimer != nil {
+		epochKeepaliveTimer.Stop()
+	}
+	epochKeepaliveTimer = time.AfterFunc(EPOCH_KEEPAWAY_DURATION, func() {
+		logger.Printf("[EPOCH] Keepalive timeout — no calls for %s, stopping\n", EPOCH_KEEPAWAY_DURATION)
+		StopGetWork()
+		lastEpochAddress = ""
+	})
+}
+
+// StopEPOCH is an explicit shutdown handler for dApps or user actions.
+// It stops the keepalive timer and closes the EPOCH connection.
+func StopEPOCH(ctx context.Context) (err error) {
+	logger.Printf("[EPOCH] StopEPOCH called\n")
+	if epochKeepaliveTimer != nil {
+		epochKeepaliveTimer.Stop()
+		epochKeepaliveTimer = nil
+	}
+	StopGetWork()
+	lastEpochAddress = ""
+	return nil
+}
+
+// GetLastEpochAddress returns the last address used by AttemptEPOCHWithAddr.
+func GetLastEpochAddress() string {
+	return lastEpochAddress
+}
+
+// SetLastEpochAddress stores the address for connection reuse tracking.
+func SetLastEpochAddress(addr string) {
+	lastEpochAddress = addr
+}
+
+// ResetKeepaliveTimer resets the silence timer after each AttemptEPOCHWithAddr call.
+func ResetKeepaliveTimer() {
+	resetEpochKeepalive()
+}
+
+// StopKeepaliveTimer stops the silence timer without closing the connection.
+func StopKeepaliveTimer() {
+	if epochKeepaliveTimer != nil {
+		epochKeepaliveTimer.Stop()
+		epochKeepaliveTimer = nil
+	}
 }
 
 // EPOCH call structures

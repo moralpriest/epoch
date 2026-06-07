@@ -58,6 +58,9 @@ const (
 	DEFAULT_MAX_THREADS = 2     // Default max thread value for EPOCH
 	DEFAULT_WORK_PORT   = 10100 // Default DERO GetWork port
 	LIMIT_MAX_HASHES    = 10000 // Maximum value that EPOCH package will accept hashes per request at
+	PONG_WAIT           = 60 * time.Second
+	PING_PERIOD         = 54 * time.Second // 90% of PONG_WAIT
+	WRITE_WAIT          = 10 * time.Second
 )
 
 // Initialize EPOCH package defaults
@@ -280,7 +283,7 @@ func StartGetWork(address, endpoint string) (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	ws, _, err := websocket.DefaultDialer.DialContext(ctx, u.String(), nil)
+	ws, _, err := dialer.DialContext(ctx, u.String(), nil)
 	if err != nil {
 		return
 	}
@@ -298,8 +301,16 @@ func StartGetWork(address, endpoint string) (err error) {
 	epoch.semaphore = make(chan struct{}, epoch.maxThreads)
 	epoch.Unlock()
 
+	ws.SetReadDeadline(time.Now().Add(PONG_WAIT))
+	ws.SetPongHandler(func(string) error {
+		ws.SetReadDeadline(time.Now().Add(PONG_WAIT))
+		return nil
+	})
+
+	done := make(chan struct{})
+
 	go func() {
-		defer StopGetWork()
+		defer close(done)
 		var result rpc.GetBlockTemplate_Result
 		for {
 			if err = epoch.conn.ws.ReadJSON(&result); err != nil {
@@ -315,6 +326,22 @@ func StartGetWork(address, endpoint string) (err error) {
 		}
 
 		logger.Printf("[EPOCH] Closed\n")
+	}()
+
+	go func() {
+		ticker := time.NewTicker(PING_PERIOD)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				ws.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
+				if err := ws.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			case <-done:
+				return
+			}
+		}
 	}()
 
 	return
