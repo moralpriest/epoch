@@ -139,7 +139,7 @@ func TestEPOCH(t *testing.T) {
 	err = StartGetWork("", endpoint)
 	assert.NoError(t, err, "Starting EPOCH should not error: %s", err)
 
-	w.Sync_Wallet_Memory_With_Daemon()
+	_ = w.Sync_Wallet_Memory_With_Daemon()
 
 	err = JobIsReady(time.Second * 10) // wait for connection and jobs
 	assert.NoError(t, err, "Finding job should not error: %s", err)
@@ -180,6 +180,7 @@ func TestEPOCH(t *testing.T) {
 	hashes := []int{5, 25, 100} // Test these hash amounts
 	startBalance, _ := w.Get_Balance()
 	lastHeight := uint64(0)
+	var submittedMu sync.Mutex
 	submitted := false
 
 	// Test AttemptEPOCH
@@ -193,7 +194,9 @@ func TestEPOCH(t *testing.T) {
 
 			t.Logf("Height: %d %+v", w.Get_Daemon_Height(), res)
 			if res.Submitted > 0 {
+				submittedMu.Lock()
 				submitted = true
+				submittedMu.Unlock()
 			}
 		}
 	})
@@ -209,7 +212,9 @@ func TestEPOCH(t *testing.T) {
 				res, err := AttemptEPOCH(context.Background(), Attempt_Params{Hashes: hashes[1]})
 				assert.NoError(t, err, "AttemptEPOCH should not error: %s", err)
 				if res.Submitted > 0 {
+					submittedMu.Lock()
 					submitted = true
+					submittedMu.Unlock()
 				}
 			}()
 		}
@@ -241,7 +246,9 @@ func TestEPOCH(t *testing.T) {
 
 			t.Logf("Height: %d %+v", w.Get_Daemon_Height(), res)
 			if res.Submitted > 0 {
+				submittedMu.Lock()
 				submitted = true
+				submittedMu.Unlock()
 			}
 		}
 	})
@@ -279,7 +286,7 @@ func TestEPOCH(t *testing.T) {
 			time.Sleep(time.Second)
 		}
 
-		w.Sync_Wallet_Memory_With_Daemon()
+		_ = w.Sync_Wallet_Memory_With_Daemon()
 		endBalance := w.GetAccount().Balance_Mature
 		assert.Greater(t, endBalance, startBalance, "Balance should be greater")
 		t.Logf("Start balance: %d  End balance: %d  Height: %d", startBalance, endBalance, w.Get_Daemon_Height())
@@ -421,7 +428,7 @@ func createTestWallet(name, dir, seed string) (wallet *walletapi.Wallet_Disk, er
 
 	wallet.SetNetwork(false)
 	wallet.SetOnlineMode()
-	wallet.Save_Wallet()
+	_ = wallet.Save_Wallet()
 
 	return
 }
