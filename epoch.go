@@ -245,21 +245,21 @@ func StartGetWork(address, endpoint string) (err error) {
 
 	host, _, err := net.SplitHostPort(endpoint)
 	if err != nil {
-		err = fmt.Errorf("could not get host: %s", err)
+		err = fmt.Errorf("could not get host: %w", err)
 		return
 	}
 
 	if address != "" {
 		err = SetAddress(address)
 		if err != nil {
-			err = fmt.Errorf("could not set address: %s", err)
+			err = fmt.Errorf("could not set address: %w", err)
 			return
 		}
 	}
 
 	_, err = globals.ParseValidateAddress(epoch.address)
 	if err != nil {
-		err = fmt.Errorf("address %q is not valid: %s", epoch.address, err)
+		err = fmt.Errorf("address %q is not valid: %w", epoch.address, err)
 		return
 	}
 
