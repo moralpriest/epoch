@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -24,78 +25,185 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// EPOCH: Event-Driven Propagation of Crowd Hashing (EPOCH)
-
-// Web socket connection and sync
+// Web socket connection and synchronization state.
 type connection struct {
-	ws *websocket.Conn
 	sync.Mutex
+	ws   *websocket.Conn
+	done chan struct{}
 }
 
-// DERO block template and sync
+func (c *connection) active() bool {
+	c.Lock()
+	defer c.Unlock()
+
+	return c.ws != nil
+}
+
+func (c *connection) install(ws *websocket.Conn) chan struct{} {
+	c.Lock()
+	defer c.Unlock()
+
+	c.done = make(chan struct{})
+	c.ws = ws
+	return c.done
+}
+
+func (c *connection) stop() {
+	c.Lock()
+	ws := c.ws
+	done := c.done
+	c.ws = nil
+	c.done = nil
+	if done != nil {
+		close(done)
+	}
+	c.Unlock()
+
+	if ws != nil {
+		_ = ws.Close()
+	}
+}
+
+func (c *connection) stopIfCurrent(ws *websocket.Conn, done chan struct{}) bool {
+	c.Lock()
+	if c.ws != ws || c.done != done {
+		c.Unlock()
+		return false
+	}
+
+	c.ws = nil
+	c.done = nil
+	close(done)
+	c.Unlock()
+
+	_ = ws.Close()
+	return true
+}
+
+func (c *connection) writeJSON(value any) error {
+	c.Lock()
+	defer c.Unlock()
+
+	if c.ws == nil {
+		return errConnectionClosed
+	}
+
+	if err := c.ws.SetWriteDeadline(time.Now().Add(WRITE_WAIT)); err != nil {
+		return fmt.Errorf("could not set websocket write deadline: %w", err)
+	}
+	if err := c.ws.WriteJSON(value); err != nil {
+		return fmt.Errorf("could not write websocket message: %w", err)
+	}
+
+	return nil
+}
+
+func (c *connection) writePing(ws *websocket.Conn) error {
+	c.Lock()
+	defer c.Unlock()
+
+	if c.ws != ws {
+		return errConnectionClosed
+	}
+
+	if err := ws.SetWriteDeadline(time.Now().Add(WRITE_WAIT)); err != nil {
+		return fmt.Errorf("could not set websocket write deadline: %w", err)
+	}
+	if err := ws.WriteMessage(websocket.PingMessage, nil); err != nil {
+		return fmt.Errorf("could not write websocket ping: %w", err)
+	}
+
+	return nil
+}
+
+// DERO block template and synchronization state.
 type jobs struct {
 	job rpc.GetBlockTemplate_Result
 	sync.RWMutex
 }
 
-// EPOCH main structure
+// EPOCH main structure.
 type EPOCH struct {
 	conn       connection             // Connection to GetWork from DERO node
 	jobs       jobs                   // DERO block template for work
 	port       string                 // GetWork port that EPOCH will connect to
 	address    string                 // EPOCH reward address
 	processing bool                   // When EPOCH is processing or submitting jobs
-	maxHashes  int                    // maxHashes is the maximum accepted hashes for a single request, this can be set as per the host app with EPOCH package defining a hard limit of LIMIT_MAX_HASHES
-	maxThreads int                    // maxThreads is the maximum concurrent workers
-	semaphore  chan struct{}          // Limit EPOCH workers to maxThreads
-	session    GetSessionEPOCH_Result // session counts the total hashes and submissions that have occurred while connection is active
+	processes  int                    // Number of concurrently running hash operations
+	maxHashes  int                    // Maximum accepted hashes for one request
+	maxThreads int                    // Maximum concurrent workers
+	semaphore  chan struct{}          // Limits workers across concurrent requests
+	session    GetSessionEPOCH_Result // Session counts hashes and submissions
 	sync.RWMutex
+	lifecycle sync.RWMutex // Serializes connection lifecycle with hash operations
 }
 
 var epoch EPOCH
 
+var (
+	errConnectionClosed = errors.New("epoch connection is closed")
+	errInvalidTimeout   = errors.New("epoch timeout must be positive")
+)
+
 const (
-	DEFAULT_MAX_THREADS = 2     // Default max thread value for EPOCH
-	DEFAULT_WORK_PORT   = 10100 // Default DERO GetWork port
-	LIMIT_MAX_HASHES    = 10000 // Maximum value that EPOCH package will accept hashes per request at
+	DEFAULT_MAX_THREADS = 2
+	DEFAULT_WORK_PORT   = 10100
+	LIMIT_MAX_HASHES    = 10000
 	PONG_WAIT           = 60 * time.Second
-	PING_PERIOD         = 54 * time.Second // 90% of PONG_WAIT
+	PING_PERIOD         = 54 * time.Second
 	WRITE_WAIT          = 10 * time.Second
 )
 
-// Initialize EPOCH package defaults
+// Initialize EPOCH package defaults.
 func init() {
 	epoch.port = fmt.Sprintf(":%d", DEFAULT_WORK_PORT)
-	SetMaxThreads(DEFAULT_MAX_THREADS)
 	epoch.maxHashes = 1000
-
-	epoch.session.Version = "1.0.0" // EPOCH package version
+	epoch.session.Version = "1.0.0"
+	SetMaxThreads(DEFAULT_MAX_THREADS)
 }
 
-// Check if EPOCH connection is active
+// Check if EPOCH connection is active.
 func IsActive() bool {
-	return epoch.conn.ws != nil
+	return epoch.conn.active()
 }
 
-// Set EPOCH processing when doing jobs or submissions
-func setProcessing(b bool) {
+// Set EPOCH processing when doing jobs or submissions.
+func setProcessing(processing bool) {
 	epoch.Lock()
-	epoch.processing = b
+	if processing {
+		epoch.processing = true
+	} else if epoch.processes == 0 {
+		epoch.processing = false
+	}
 	epoch.Unlock()
 }
 
-// Set a new DERO block template and return lastError
+func beginProcessing() {
+	epoch.Lock()
+	epoch.processes++
+	epoch.processing = true
+	epoch.Unlock()
+}
+
+func endProcessing() {
+	epoch.Lock()
+	if epoch.processes > 0 {
+		epoch.processes--
+	}
+	epoch.processing = epoch.processes > 0
+	epoch.Unlock()
+}
+
+// Set a new DERO block template and return its last error.
 func (e *EPOCH) newJob(job rpc.GetBlockTemplate_Result) (lastError string) {
 	e.jobs.Lock()
 	e.jobs.job = job
 	e.jobs.Unlock()
 
-	lastError = job.LastError
-
-	return
+	return job.LastError
 }
 
-// Get the current DERO block template
+// Get the current DERO block template.
 func (e *EPOCH) getJob() (job rpc.GetBlockTemplate_Result) {
 	e.jobs.RLock()
 	job = e.jobs.job
@@ -104,41 +212,44 @@ func (e *EPOCH) getJob() (job rpc.GetBlockTemplate_Result) {
 	return
 }
 
-// JobIsReady waits for a JobID to be present, it returns error if job is not found before timeout duration
+// JobIsReady waits for a JobID to be present, or returns an error after timeout.
 func JobIsReady(timeout time.Duration) (err error) {
+	if timeout <= 0 {
+		return fmt.Errorf("could not get EPOCH job: %w", errInvalidTimeout)
+	}
+
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
+		epoch.jobs.RLock()
+		ready := epoch.jobs.job.JobID != ""
+		epoch.jobs.RUnlock()
+		if ready {
+			return nil
+		}
+
 		select {
 		case <-timer.C:
-			err = fmt.Errorf("could not get EPOCH job after %s", timeout)
-			return
-		default:
-			epoch.jobs.RLock()
-			ready := epoch.jobs.job.JobID != ""
-			epoch.jobs.RUnlock()
-			if ready {
-				return
-			}
-
-			time.Sleep(time.Second)
+			return fmt.Errorf("could not get EPOCH job after %s", timeout)
+		case <-ticker.C:
 		}
 	}
 }
 
-// Check if EPOCH is processing jobs or submissions
+// Check if EPOCH is processing jobs or submissions.
 func IsProcessing() bool {
 	epoch.RLock()
 	defer epoch.RUnlock()
 
-	return epoch.processing
+	return epoch.processing || epoch.processes > 0
 }
 
-// Set the EPOCH reward address, must be a registered DERO address
+// Set the EPOCH reward address, which must be a registered DERO address.
 func SetAddress(address string) (err error) {
-	_, err = globals.ParseValidateAddress(address)
-	if err != nil {
+	if _, err = globals.ParseValidateAddress(address); err != nil {
 		return
 	}
 
@@ -146,10 +257,10 @@ func SetAddress(address string) (err error) {
 	epoch.address = address
 	epoch.Unlock()
 
-	return
+	return nil
 }
 
-// Get the EPOCH reward address
+// Get the EPOCH reward address.
 func GetAddress() string {
 	epoch.RLock()
 	defer epoch.RUnlock()
@@ -157,43 +268,44 @@ func GetAddress() string {
 	return epoch.address
 }
 
-// Set the GetWork port if port is valid
+// Set the GetWork port if port is valid.
 func SetPort(port int) (err error) {
 	if port < 1 || port > 65535 {
-		err = fmt.Errorf("invalid EPOCH port")
-		return
+		return fmt.Errorf("invalid EPOCH port %d", port)
 	}
 
 	epoch.Lock()
 	epoch.port = fmt.Sprintf(":%d", port)
 	epoch.Unlock()
 
-	return
+	return nil
 }
 
-// Get the EPOCH work port
+// Get the EPOCH work port.
 func GetPort() string {
 	epoch.RLock()
 	defer epoch.RUnlock()
 
-	return strings.Trim(epoch.port, ":")
+	return strings.TrimPrefix(epoch.port, ":")
 }
 
-// Set the max amount of hash attempts or job submissions that a single request can handle, exceeding MAX_HASHES will return error
-func SetMaxHashes(i int) (err error) {
-	if i > LIMIT_MAX_HASHES {
-		err = fmt.Errorf("cannot exceed %d hashes", LIMIT_MAX_HASHES)
-		return
+// Set the maximum number of hash attempts or submissions for one request.
+func SetMaxHashes(hashes int) (err error) {
+	if hashes < 1 {
+		return fmt.Errorf("hashes must be at least 1")
+	}
+	if hashes > LIMIT_MAX_HASHES {
+		return fmt.Errorf("cannot exceed %d hashes", LIMIT_MAX_HASHES)
 	}
 
 	epoch.Lock()
-	epoch.maxHashes = i
+	epoch.maxHashes = hashes
 	epoch.Unlock()
 
-	return
+	return nil
 }
 
-// Get the EPOCH maxHashes value
+// Get the EPOCH maxHashes value.
 func GetMaxHashes() int {
 	epoch.RLock()
 	defer epoch.RUnlock()
@@ -201,30 +313,30 @@ func GetMaxHashes() int {
 	return epoch.maxHashes
 }
 
-// Parse EPOCH hashes and return as formatted string
+// Parse EPOCH hashes and return them as a formatted string.
 func HashesToString(hashes uint64) string {
-	if hashes > 10000000 {
-		return fmt.Sprintf("%.1fM", float64(hashes)/1000000)
-	} else {
-		return fmt.Sprintf("%.1fK", float64(hashes)/1000)
+	if hashes >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(hashes)/1_000_000)
 	}
+
+	return fmt.Sprintf("%.1fK", float64(hashes)/1_000)
 }
 
-// Set the max amount of threads to be used when attempting or submitting, max is limited to total available and minimum of 1
-func SetMaxThreads(i int) {
+// Set the maximum number of threads used for attempting or submitting.
+func SetMaxThreads(threads int) {
 	max := runtime.NumCPU()
-	if i > max {
-		i = max
-	} else if i < 1 {
-		i = 1
+	if threads > max {
+		threads = max
+	} else if threads < 1 {
+		threads = 1
 	}
 
 	epoch.Lock()
-	epoch.maxThreads = i
+	epoch.maxThreads = threads
 	epoch.Unlock()
 }
 
-// Get the EPOCH maxThreads value
+// Get the EPOCH maxThreads value.
 func GetMaxThreads() int {
 	epoch.RLock()
 	defer epoch.RUnlock()
@@ -232,52 +344,71 @@ func GetMaxThreads() int {
 	return epoch.maxThreads
 }
 
-// Stop listening to GetWork server
+// Stop listening to the GetWork server.
 func StopGetWork() {
-	epoch.conn.Lock()
-	if epoch.conn.ws != nil {
-		epoch.conn.ws.Close()
-		epoch.conn.ws = nil
-	}
-	epoch.conn.Unlock()
+	epoch.lifecycle.Lock()
+	defer epoch.lifecycle.Unlock()
+
+	epoch.conn.stop()
+	clearJobLocked()
 }
 
-// Start listening to GetWork server, if address is empty string epoch.address will be used,
-// endpoint is a DERO daemon address and will use the port defined by SetPort() to connect to GetWork,
-// when StartGetWork is successfully connected it will set the EPOCH session totals to zero
+func clearJobLocked() {
+	epoch.jobs.Lock()
+	epoch.jobs.job = rpc.GetBlockTemplate_Result{}
+	epoch.jobs.Unlock()
+}
+
+func clearJobIfInactive() {
+	epoch.lifecycle.Lock()
+	defer epoch.lifecycle.Unlock()
+
+	if !epoch.conn.active() {
+		clearJobLocked()
+	}
+}
+
+// Start listening to the GetWork server. If address is empty, the configured
+// EPOCH address is used. endpoint is the DERO daemon address.
 func StartGetWork(address, endpoint string) (err error) {
+	epoch.lifecycle.Lock()
+	defer epoch.lifecycle.Unlock()
+
 	if IsActive() {
-		err = fmt.Errorf("already running")
-		return
+		return fmt.Errorf("already running")
 	}
 
 	host, _, err := net.SplitHostPort(endpoint)
 	if err != nil {
-		err = fmt.Errorf("could not get host: %w", err)
-		return
+		return fmt.Errorf("could not get host: %w", err)
 	}
 
 	if address != "" {
-		err = SetAddress(address)
-		if err != nil {
-			err = fmt.Errorf("could not set address: %w", err)
-			return
+		if err = SetAddress(address); err != nil {
+			return fmt.Errorf("could not set address: %w", err)
 		}
 	}
 
-	_, err = globals.ParseValidateAddress(epoch.address)
-	if err != nil {
-		err = fmt.Errorf("address %q is not valid: %w", epoch.address, err)
-		return
+	epoch.RLock()
+	rewardAddress := epoch.address
+	workPort := strings.TrimPrefix(epoch.port, ":")
+	maxThreads := epoch.maxThreads
+	epoch.RUnlock()
+
+	if _, err = globals.ParseValidateAddress(rewardAddress); err != nil {
+		return fmt.Errorf("address %q is not valid: %w", rewardAddress, err)
 	}
 
-	endpoint = host + epoch.port
+	workEndpoint := net.JoinHostPort(host, workPort)
+	u := url.URL{Scheme: "wss", Host: workEndpoint, Path: "/ws/" + rewardAddress}
 
-	u := url.URL{Scheme: "wss", Host: endpoint, Path: "/ws/" + epoch.address}
-
-	dialer := websocket.DefaultDialer
+	// DERO GetWork endpoints commonly use self-signed certificates. Keep the
+	// historical behavior, but use a private dialer so global websocket state
+	// is never mutated. Certificate pinning/configuration should be exposed in
+	// a future API for deployments requiring server authentication.
+	dialer := *websocket.DefaultDialer
 	dialer.TLSClientConfig = &tls.Config{
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: true, //nolint:gosec // required for existing DERO GetWork endpoints
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -285,288 +416,308 @@ func StartGetWork(address, endpoint string) (err error) {
 
 	ws, _, err := dialer.DialContext(ctx, u.String(), nil)
 	if err != nil {
-		return
+		return fmt.Errorf("could not connect to GetWork: %w", err)
 	}
 
-	epoch.conn.Lock()
-	epoch.conn.ws = ws
-	epoch.conn.Unlock()
+	if err = ws.SetReadDeadline(time.Now().Add(PONG_WAIT)); err != nil {
+		_ = ws.Close()
+		return fmt.Errorf("could not set websocket read deadline: %w", err)
+	}
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(PONG_WAIT))
+	})
 
-	logger.Printf("[EPOCH] Connected to %s\n", u.String())
-	logger.Printf("[EPOCH] Will use %d threads\n", epoch.maxThreads)
-
+	epoch.jobs.Lock()
+	epoch.jobs.job = rpc.GetBlockTemplate_Result{}
+	epoch.jobs.Unlock()
 	epoch.Lock()
 	epoch.session.Hashes = 0
 	epoch.session.MiniBlocks = 0
-	epoch.semaphore = make(chan struct{}, epoch.maxThreads)
+	epoch.semaphore = make(chan struct{}, maxThreads)
 	epoch.Unlock()
 
-	ws.SetReadDeadline(time.Now().Add(PONG_WAIT))
-	ws.SetPongHandler(func(string) error {
-		ws.SetReadDeadline(time.Now().Add(PONG_WAIT))
-		return nil
-	})
+	done := epoch.conn.install(ws)
+	logger.Printf("[EPOCH] Connected to %s\n", u.String())
+	logger.Printf("[EPOCH] Will use %d threads\n", maxThreads)
 
-	done := make(chan struct{})
+	go readJobs(ws, done)
+	go pingConnection(ws, done)
 
-	go func() {
-		defer close(done)
-		var result rpc.GetBlockTemplate_Result
-		for {
-			if err = epoch.conn.ws.ReadJSON(&result); err != nil {
-				if !strings.Contains(err.Error(), "closed network connection") {
-					logger.Errorf("[EPOCH] connection error: %s\n", err)
-				}
-				break
-			}
-
-			if lastError := epoch.newJob(result); lastError != "" {
-				logger.Errorf("[EPOCH] Job error: %s\n", lastError)
-			}
-		}
-
-		logger.Printf("[EPOCH] Closed\n")
-	}()
-
-	go func() {
-		ticker := time.NewTicker(PING_PERIOD)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				ws.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
-				if err := ws.WriteMessage(websocket.PingMessage, nil); err != nil {
-					return
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	return
+	return nil
 }
 
-// GetSession returns the current EPOCH session statistics, it will wait while EPOCH is processing and return error if result is not found before timeout duration
-func GetSession(timeout time.Duration) (session GetSessionEPOCH_Result, err error) {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+func readJobs(ws *websocket.Conn, done chan struct{}) {
+	defer func() {
+		if epoch.conn.stopIfCurrent(ws, done) {
+			clearJobIfInactive()
+		}
+	}()
+
+	var result rpc.GetBlockTemplate_Result
+	for {
+		if readErr := ws.ReadJSON(&result); readErr != nil {
+			if !websocket.IsCloseError(readErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) && !strings.Contains(readErr.Error(), "closed network connection") {
+				logger.Errorf("[EPOCH] connection error: %s\n", readErr)
+			}
+			break
+		}
+
+		if lastError := epoch.newJob(result); lastError != "" {
+			logger.Errorf("[EPOCH] Job error: %s\n", lastError)
+		}
+	}
+
+	logger.Printf("[EPOCH] Closed\n")
+}
+
+func pingConnection(ws *websocket.Conn, done chan struct{}) {
+	ticker := time.NewTicker(PING_PERIOD)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-timer.C:
-			err = fmt.Errorf("could not get EPOCH session after %s", timeout)
-			return
-		default:
-			if !IsProcessing() {
-				epoch.RLock()
-				session = epoch.session
-				epoch.RUnlock()
+		case <-ticker.C:
+			if err := epoch.conn.writePing(ws); err != nil {
+				if epoch.conn.stopIfCurrent(ws, done) {
+					clearJobIfInactive()
+				}
 				return
 			}
-
-			time.Sleep(time.Millisecond * 25)
+		case <-done:
+			return
 		}
 	}
 }
 
-// Compute POW hash from a job template and return variables for block submission
+// GetSession returns the current EPOCH session statistics, or an error if the
+// operation does not finish before timeout.
+func GetSession(timeout time.Duration) (session GetSessionEPOCH_Result, err error) {
+	if timeout <= 0 {
+		return session, fmt.Errorf("could not get EPOCH session: %w", errInvalidTimeout)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if !IsProcessing() {
+			epoch.RLock()
+			session = epoch.session
+			epoch.RUnlock()
+			return session, nil
+		}
+
+		select {
+		case <-timer.C:
+			return session, fmt.Errorf("could not get EPOCH session after %s", timeout)
+		case <-ticker.C:
+		}
+	}
+}
+
+// Compute a POW hash from a job template and return variables for submission.
 func powHash() (job rpc.GetBlockTemplate_Result, powhash [32]byte, work [block.MINIBLOCK_SIZE]byte, diff big.Int, err error) {
-	var random_buf [12]byte
-	if _, err = rand.Read(random_buf[:]); err != nil {
-		err = fmt.Errorf("could not generate random bytes: %w", err)
-		return
+	var randomBuf [12]byte
+	if _, err = rand.Read(randomBuf[:]); err != nil {
+		return job, powhash, work, diff, fmt.Errorf("could not generate random bytes: %w", err)
 	}
 
 	job = epoch.getJob()
 
-	n, err := hex.Decode(work[:], []byte(job.Blockhashing_blob))
-	if err != nil || n != block.MINIBLOCK_SIZE {
-		err = fmt.Errorf("block hashing could not be decoded successfully %+v %d: %w", job, n, err)
-		return
+	n, decodeErr := hex.Decode(work[:], []byte(job.Blockhashing_blob))
+	if decodeErr != nil {
+		return job, powhash, work, diff, fmt.Errorf("could not decode block hashing blob: %w", decodeErr)
+	}
+	if n != block.MINIBLOCK_SIZE {
+		return job, powhash, work, diff, fmt.Errorf("decoded block hashing blob has %d bytes, want %d", n, block.MINIBLOCK_SIZE)
 	}
 
-	copy(work[block.MINIBLOCK_SIZE-12:], random_buf[:]) // add more randomization in the mix
-	work[block.MINIBLOCK_SIZE-1] = byte(1)
+	copy(work[block.MINIBLOCK_SIZE-12:], randomBuf[:])
+	work[block.MINIBLOCK_SIZE-1] = 1
 
-	diff.SetString(job.Difficulty, 10)
-
-	if work[0]&0xf != 1 { // check  version
-		err = fmt.Errorf("unknown version, please check for updates %v", work[0]&0x1f)
-		return
+	if _, ok := diff.SetString(job.Difficulty, 10); !ok || diff.Sign() <= 0 {
+		return job, powhash, work, diff, fmt.Errorf("invalid EPOCH difficulty %q", job.Difficulty)
 	}
 
-	// binary.BigEndian.PutUint32(nonce_buf, uint32(1))
+	if work[0]&0xf != 1 {
+		return job, powhash, work, diff, fmt.Errorf("unknown version, please check for updates %v", work[0]&0xf)
+	}
 
 	powhash = astrobwtv3.AstroBWTv3(work[:])
-
-	return
+	return job, powhash, work, diff, nil
 }
 
-// Check if powhash is valid and submit it as a miniblock to connected daemon if so
+// Check if powhash is valid and submit it as a miniblock to the connected daemon.
 func submitBlock(job rpc.GetBlockTemplate_Result, powhash [32]byte, work [block.MINIBLOCK_SIZE]byte, diff big.Int) (valid bool, err error) {
-	if !IsActive() {
-		err = fmt.Errorf("connection is closed")
-		return
+	if !blockchain.CheckPowHashBig(powhash, &diff) {
+		return false, nil
 	}
 
-	if blockchain.CheckPowHashBig(powhash, &diff) { // note we are doing a local, NW might have moved meanwhile
-		logger.Printf("[EPOCH] Submitting valid miniblock POW hash, difficulty: %s height: %d\n", job.Difficulty, job.Height)
-		epoch.conn.Lock()
-		defer epoch.conn.Unlock()
-		if err = epoch.conn.ws.WriteJSON(rpc.SubmitBlock_Params{JobID: job.JobID, MiniBlockhashing_blob: fmt.Sprintf("%x", work[:])}); err == nil {
-			valid = true
-		}
+	logger.Printf("[EPOCH] Submitting valid miniblock POW hash, difficulty: %s height: %d\n", job.Difficulty, job.Height)
+	if err = epoch.conn.writeJSON(rpc.SubmitBlock_Params{
+		JobID:                 job.JobID,
+		MiniBlockhashing_blob: fmt.Sprintf("%x", work[:]),
+	}); err != nil {
+		return false, err
 	}
 
-	return
+	return true, nil
 }
 
-// AttemptHashes performs the POW for the number of hashes and submits valid hashes as miniblocks to the connected node,
-// when it is called it increases the session total for hashes and blocks as per the result
-func AttemptHashes(hashes int) (result EPOCH_Result, err error) {
-	if !IsActive() {
-		err = fmt.Errorf("epoch is not active")
-		return
+type workerResult struct {
+	submitted bool
+	err       error
+}
+
+func runWorkers(count int, work func() (bool, error)) (attempted, submitted int, firstErr error) {
+	return runIndexedWorkers(count, func(int) (bool, error) {
+		return work()
+	})
+}
+
+func runIndexedWorkers(count int, work func(int) (bool, error)) (attempted, submitted int, firstErr error) {
+	if count == 0 {
+		return 0, 0, nil
 	}
 
-	if hashes > GetMaxHashes() {
-		err = fmt.Errorf("hashes exceeds maxHashes %d/%d", hashes, epoch.maxHashes)
-		return
+	epoch.RLock()
+	semaphore := epoch.semaphore
+	maxThreads := epoch.maxThreads
+	epoch.RUnlock()
+	if semaphore == nil || maxThreads < 1 || cap(semaphore) < 1 {
+		return 0, 0, errConnectionClosed
 	}
 
-	setProcessing(true)
-	defer setProcessing(false)
-
+	workerCount := min(count, min(maxThreads, cap(semaphore)))
+	tasks := make(chan int)
+	results := make(chan workerResult, count)
 	var wg sync.WaitGroup
-	var errMu sync.Mutex
-	var submitted int
+	wg.Add(workerCount)
 
-	i := 0
-	now := time.Now()
-
-	for i = 0; i < hashes; i++ {
-		if result.Error != nil {
-			break
-		}
-
-		epoch.semaphore <- struct{}{}
-
-		wg.Add(1)
+	for i := 0; i < workerCount; i++ {
 		go func() {
-			defer func() {
-				<-epoch.semaphore
-				wg.Done()
-			}()
-
-			job, powhash, work, diff, err := powHash()
-			if err != nil {
-				errMu.Lock()
-				if result.Error == nil {
-					result.Error = err
-				}
-				errMu.Unlock()
-				return
-			}
-
-			valid, err := submitBlock(job, powhash, work, diff)
-			if err != nil {
-				errMu.Lock()
-				if result.Error == nil {
-					result.Error = err
-				}
-				errMu.Unlock()
-				return
-			}
-
-			if valid {
-				submitted++
+			defer wg.Done()
+			for index := range tasks {
+				semaphore <- struct{}{}
+				isSubmitted, err := work(index)
+				<-semaphore
+				results <- workerResult{submitted: isSubmitted, err: err}
 			}
 		}()
 	}
 
+	for i := 0; i < count; i++ {
+		tasks <- i
+	}
+	close(tasks)
 	wg.Wait()
+	close(results)
 
-	duration := time.Since(now)
-	result.Duration = duration.Milliseconds()
+	for result := range results {
+		attempted++
+		if result.submitted {
+			submitted++
+		}
+		if result.err != nil && firstErr == nil {
+			firstErr = result.err
+		}
+	}
 
-	h := uint64(i)
-	result.Hashes = h
-	result.Submitted = submitted
-
-	epoch.Lock()
-	epoch.session.Hashes += h
-	epoch.session.MiniBlocks += result.Submitted
-	epoch.Unlock()
-
-	hashPerSecond := float64(h) / duration.Seconds()
-	result.HashPerSec = math.Round(hashPerSecond*100) / 100
-
-	return
+	return attempted, submitted, firstErr
 }
 
-// SubmitHashes checks and submits valid pre computed hashes as miniblocks to the connected node,
-// only the block session total will be increased when it is called
-func SubmitHashes(params []Submit_Params) (result EPOCH_Result, err error) {
+// AttemptHashes performs POW for the requested number of hashes and submits
+// valid hashes as miniblocks to the connected node.
+func AttemptHashes(hashes int) (result EPOCH_Result, err error) {
+	epoch.lifecycle.RLock()
+	defer epoch.lifecycle.RUnlock()
+
 	if !IsActive() {
-		err = fmt.Errorf("epoch is not active")
-		return
+		return result, fmt.Errorf("epoch is not active: %w", errConnectionClosed)
 	}
 
-	l := len(params)
-	if l > GetMaxHashes() {
-		err = fmt.Errorf("requested submission exceeds maxHashes %d/%d", epoch.maxHashes, l)
-		return
+	maxHashes := GetMaxHashes()
+	if hashes < 1 {
+		return result, fmt.Errorf("hashes must be at least 1")
+	}
+	if hashes > maxHashes {
+		return result, fmt.Errorf("hashes exceeds maxHashes %d/%d", hashes, maxHashes)
 	}
 
-	setProcessing(true)
-	defer setProcessing(false)
+	beginProcessing()
+	defer endProcessing()
 
-	var wg sync.WaitGroup
-	var errMu sync.Mutex
-
-	now := time.Now()
-	submitted := 0
-
-	for _, p := range params {
-		if result.Error != nil {
-			break
+	started := time.Now()
+	attempted, submitted, firstErr := runWorkers(hashes, func() (bool, error) {
+		job, powhash, work, diff, powErr := powHash()
+		if powErr != nil {
+			return false, powErr
 		}
+		return submitBlock(job, powhash, work, diff)
+	})
 
-		epoch.semaphore <- struct{}{}
-
-		wg.Add(1)
-		go func(p Submit_Params) {
-			defer func() {
-				<-epoch.semaphore
-				wg.Done()
-			}()
-
-			valid, err := submitBlock(p.Job, p.PowHash, p.EpochWork, p.Difficulty)
-			if err != nil {
-				errMu.Lock()
-				if result.Error == nil {
-					result.Error = err
-				}
-				errMu.Unlock()
-				return
-			}
-
-			if valid {
-				submitted++
-			}
-		}(p)
+	result.Hashes = uint64(attempted)
+	result.Submitted = submitted
+	duration := time.Since(started)
+	result.Duration = duration.Milliseconds()
+	if duration > 0 {
+		result.HashPerSec = math.Round(float64(attempted)/duration.Seconds()*100) / 100
 	}
 
-	wg.Wait()
+	epoch.Lock()
+	epoch.session.Hashes += uint64(attempted)
+	epoch.session.MiniBlocks += submitted
+	epoch.Unlock()
 
-	result.Duration = time.Since(now).Milliseconds()
-	result.Hashes = uint64(len(params))
+	if firstErr != nil {
+		result.Error = firstErr
+		return result, firstErr
+	}
+
+	return result, nil
+}
+
+// SubmitHashes checks and submits valid precomputed hashes as miniblocks. Only
+// the session miniblock total is increased by this method.
+func SubmitHashes(params []Submit_Params) (result EPOCH_Result, err error) {
+	epoch.lifecycle.RLock()
+	defer epoch.lifecycle.RUnlock()
+
+	if !IsActive() {
+		return result, fmt.Errorf("epoch is not active: %w", errConnectionClosed)
+	}
+
+	maxHashes := GetMaxHashes()
+	if len(params) > maxHashes {
+		return result, fmt.Errorf("requested submission exceeds maxHashes %d/%d", len(params), maxHashes)
+	}
+
+	beginProcessing()
+	defer endProcessing()
+
+	started := time.Now()
+	attempted, submitted, firstErr := runSubmitWorkers(params)
+
+	result.Hashes = uint64(attempted)
 	result.Submitted = submitted
-
+	result.Duration = time.Since(started).Milliseconds()
 	epoch.Lock()
 	epoch.session.MiniBlocks += submitted
 	epoch.Unlock()
 
-	return
+	if firstErr != nil {
+		result.Error = firstErr
+		return result, firstErr
+	}
+
+	return result, nil
+}
+
+func runSubmitWorkers(params []Submit_Params) (attempted, submitted int, firstErr error) {
+	return runIndexedWorkers(len(params), func(index int) (bool, error) {
+		param := params[index]
+		return submitBlock(param.Job, param.PowHash, param.EpochWork, param.Difficulty)
+	})
 }
