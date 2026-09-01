@@ -157,7 +157,7 @@ const (
 // Initialize EPOCH package defaults.
 func init() {
 	epoch.port = fmt.Sprintf(":%d", DEFAULT_WORK_PORT)
-	epoch.maxHashes = 1000
+	epoch.maxHashes = LIMIT_MAX_HASHES
 	epoch.session.Version = "1.0.0"
 	SetMaxThreads(DEFAULT_MAX_THREADS)
 }
